@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+langchain
+langchain-community
+langchain-ollama
+duckduckgo-search
+crawl4ai
+faiss-cpu
+tiktoken
+python-dotenv
