@@ -1,53 +1,93 @@
 import sys
 import asyncio
-import nest_asyncio
+import os
 from ddgs import DDGS
-from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
+from openai import AsyncOpenAI
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import PromptTemplate
-from memory import query_memory # <-- IMPORT MEMORY READER
+from memory import query_memory
 
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-nest_asyncio.apply()
 
-fast_llm = ChatOllama(model="llama3.2:1b", temperature=0.1) 
+openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 heavy_llm = ChatOllama(model="llama3.1:8b", temperature=0.1)
-semaphore = asyncio.Semaphore(3)
+
+_cache: dict = {}
+
 
 async def expand_query(topic: str) -> list[str]:
-    """Uses Fast Model to generate 5 robust queries."""
-    prompt = PromptTemplate.from_template(
-        "Break '{topic}' into 5 specific search queries. "
-        "Mix query types: include 'tutorial', 'best practices', "
-        "'common errors', 'example', 'vs alternatives'. "
-        "Output ONLY comma-separated queries, nothing else."
-    )
-    chain = prompt | fast_llm
-    result = await chain.ainvoke({"topic": topic})
-    return [q.strip() for q in result.content.split(",") if q.strip()]
+    """GPT-4o-mini generates 3 clean search queries. Fallback to local 1B."""
+    print("🤖 Expanding queries via GPT-4o-mini...")
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Generate exactly 3 short web search queries for the given topic. "
+                        "Output ONLY the 3 queries separated by commas. "
+                        "Each query must be under 12 words. "
+                        "No preamble, numbering, labels, or explanation. "
+                        "Format: query1, query2, query3"
+                    )
+                },
+                {"role": "user", "content": topic}
+            ],
+            max_tokens=100,
+            temperature=0.3
+        )
+        raw = response.choices[0].message.content or ""
+        queries = [q.strip().strip('"') for q in raw.split(",") if 5 < len(q.strip()) < 150][:3]
+        print(f"🔍 Queries: {queries}")
+        return queries if queries else [topic[:100]]
+    except Exception as e:
+        print(f"⚠️ OpenAI query expansion failed: {e} — falling back to local")
+        return await _expand_query_local(topic)
 
-async def process_url(crawler, url, topic):
-    """Worker: Parallel Scrape + Token Reduction + Extraction."""
-    async with semaphore:
-        try:
-            config = CrawlerRunConfig(cache_mode=CacheMode.ENABLED)
-            scrape_result = await crawler.arun(url=url, config=config)
-            clean_text = scrape_result.markdown[:3500] 
-            
-            if clean_text:
-                prompt = PromptTemplate.from_template(
-                    "Extract technical facts and code snippets about '{topic}' from: {text}"
-                )
-                chain = prompt | heavy_llm 
-                result = await chain.ainvoke({"topic": topic, "text": clean_text})
-                return f"### Facts from {url}:\n{result.content}\n"
-            return ""
-        except Exception:
-            return ""
+
+async def _expand_query_local(topic: str) -> list[str]:
+    fast_llm = ChatOllama(model="llama3.2:1b", temperature=0.1)
+    prompt = PromptTemplate.from_template(
+        "Generate 3 search queries for: {topic}\n"
+        "Output ONLY comma-separated queries. No labels.\n"
+        "Format: query1, query2, query3"
+    )
+    result = await (prompt | fast_llm).ainvoke({"topic": topic})
+    queries = [q.strip() for q in result.content.split(",") if 5 < len(q.strip()) < 150]
+    return queries[:3] if queries else [topic[:100]]
+
+
+def _ddg_search(query: str, max_results: int = 3) -> tuple[list[str], list[str]]:
+    snippets, sources = [], []
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        for r in results:
+            if r.get("body"):
+                snippets.append(f"### {r.get('title', 'Source')}\n{r['body']}")
+            if r.get("href"):
+                sources.append(r["href"])
+    except Exception as e:
+        print(f"⚠️ DDG failed for '{query}': {e}")
+    return snippets, sources
+
+
+async def fetch_all_snippets(queries: list[str]) -> tuple[list[str], list[str]]:
+    """All DDG searches fire in parallel."""
+    loop = asyncio.get_event_loop()
+    tasks = [loop.run_in_executor(None, _ddg_search, q) for q in queries]
+    results = await asyncio.gather(*tasks)
+    all_snippets, all_sources = [], []
+    for snippets, sources in results:
+        all_snippets.extend(snippets)
+        all_sources.extend(sources)
+    return all_snippets, all_sources
+
 
 async def synthesize_results(topic: str, combined_facts: str, existing_knowledge: str) -> str:
-    """Structured technical writing using live + past data."""
+    """Local 8B synthesis — research data stays private, never sent to OpenAI."""
     prompt = PromptTemplate.from_template("""
         You are a Principal Engineer writing a technical reference document.
 
@@ -57,7 +97,7 @@ async def synthesize_results(topic: str, combined_facts: str, existing_knowledge
 
         Write a highly structured technical report with these EXACT sections:
         ## Overview
-        ## Key Concepts  
+        ## Key Concepts
         ## Implementation Details
         ## Code Examples
         ## Common Pitfalls
@@ -67,51 +107,56 @@ async def synthesize_results(topic: str, combined_facts: str, existing_knowledge
         Rules:
         - Be deeply specific and technical.
         - Include actual code snippets where relevant.
-        - If facts contradict each other, note both perspectives.
-        - Combine insights from the Existing Knowledge and New Web Research seamlessly.
-        - If facts are insufficient, use your internal training knowledge to fill gaps.
+        - If facts contradict, note both perspectives.
+        - Combine Existing Knowledge and New Research seamlessly.
+        - Fill gaps using your internal training knowledge.
     """)
-    chain = prompt | heavy_llm
-    final_report = await chain.ainvoke({
-        "topic": topic, 
+    result = await (prompt | heavy_llm).ainvoke({
+        "topic": topic,
         "facts": combined_facts,
         "existing_knowledge": existing_knowledge
     })
-    return final_report.content
+    return result.content
+
 
 async def run_deep_research(topic: str) -> dict:
-    print(f"\n--- Starting High-Speed Research: {topic} ---")
-    
-    # 1. READ FROM FAISS MEMORY
-    existing_knowledge = query_memory(topic)
+    print(f"\n--- Starting Research: {topic} ---")
+
+    cache_key = topic.strip().lower()
+    if cache_key in _cache:
+        print("⚡ Cache hit")
+        return _cache[cache_key]
+
+    # Step 1: Memory + query expansion in parallel
+    loop = asyncio.get_event_loop()
+    existing_knowledge, queries = await asyncio.gather(
+        loop.run_in_executor(None, query_memory, topic),
+        expand_query(topic)
+    )
+
     if existing_knowledge:
-        print(f"🧠 Found existing contextual memory for: {topic}")
+        print("🧠 Found existing memory for topic")
 
-    # 2. GENERATE UP TO 15 URLs (5 queries x 3 results)
-    queries = await expand_query(topic)
-    all_sources = []
-    
-    async with AsyncWebCrawler() as crawler:
-        tasks = []
-        for query in queries:
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=3)) # Boosted from 2 to 3
-            
-            urls = [res.get('href') for res in results if 'href' in res]
-            all_sources.extend(urls)
-            for url in urls:
-                tasks.append(process_url(crawler, url, topic))
-        
-        # 3. RUN PARALLEL SCRAPERS
-        fact_results = await asyncio.gather(*tasks)
-        combined_facts = "\n".join([f for f in fact_results if f])
+    # Step 2: Parallel DDG fetches
+    snippets, all_sources = await fetch_all_snippets(queries)
+    print(f"📄 {len(snippets)} snippets from {len(all_sources)} sources")
 
-    # 4. STRUCTURED SYNTHESIS
+    # Step 3: Synthesize (local 8B, stays private)
+    combined_facts = "\n\n".join(snippets)[:6000]
     final_report = await synthesize_results(topic, combined_facts, existing_knowledge)
-    
-    return {
+
+    # Step 4: Reflection — model critiques its own report
+    # Import here to avoid circular imports
+    from coder_agent import reflect_on_report
+    reflection = await reflect_on_report(topic, final_report)
+    final_report = final_report + "\n\n" + reflection
+
+    result = {
         "report": final_report,
         "queries": queries,
         "sources": list(set(all_sources)),
         "raw_data": [combined_facts]
     }
+
+    _cache[cache_key] = result
+    return result
